@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Map, Save, RotateCcw, Plus, Trash2, Edit3, Eye } from 'lucide-react';
+import { Map, Save, RotateCcw, Plus, Trash2, Edit3, Eye, Grid, Layers, Palette, Download, Upload } from 'lucide-react';
 import { apiService } from '../services/api';
 import { HexTile } from '../types/game';
+import { hexToPixel, generateHexPath, HEX_SIZE } from '../utils/hexUtils';
 
 interface MapDesignerProps {
   onClose: () => void;
@@ -10,18 +11,16 @@ interface MapDesignerProps {
 export function MapDesigner({ onClose }: MapDesignerProps) {
   const [territories, setTerritories] = useState<HexTile[]>([]);
   const [selectedHex, setSelectedHex] = useState<HexTile | null>(null);
-  const [editMode, setEditMode] = useState<'view' | 'edit' | 'create'>('view');
-  const [newHex, setNewHex] = useState({
-    q: 0,
-    r: 0,
-    nation: 'neutral' as const,
-    name: '',
-    type: 'land' as const,
-    isContested: false,
-    underAttack: false
-  });
+  const [editMode, setEditMode] = useState<'view' | 'edit' | 'create' | 'bulk'>('view');
+  const [selectedNation, setSelectedNation] = useState<'neutral' | 'union' | 'dominion' | 'syndicate'>('neutral');
+  const [selectedType, setSelectedType] = useState<'land' | 'water' | 'mountain' | 'resource'>('land');
+  const [bulkEditMode, setBulkEditMode] = useState<'nation' | 'type' | 'status'>('nation');
+  const [selectedHexes, setSelectedHexes] = useState<Set<string>>(new Set());
+  const [showGrid, setShowGrid] = useState(true);
+  const [zoom, setZoom] = useState(1);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
+  const [undoStack, setUndoStack] = useState<HexTile[][]>([]);
 
   useEffect(() => {
     loadTerritories();
@@ -43,8 +42,24 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
         type: 'land' as const
       }));
       setTerritories(hexTiles);
+      // Save initial state for undo
+      setUndoStack([hexTiles]);
     } catch (error) {
       console.error('Failed to load territories:', error);
+    }
+  };
+
+  const saveState = () => {
+    setUndoStack(prev => [...prev.slice(-9), territories]); // Keep last 10 states
+  };
+
+  const undo = () => {
+    if (undoStack.length > 1) {
+      const newStack = [...undoStack];
+      newStack.pop(); // Remove current state
+      const previousState = newStack[newStack.length - 1];
+      setTerritories(previousState);
+      setUndoStack(newStack);
     }
   };
 
@@ -56,7 +71,6 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
         is_contested: hex.isContested,
         under_attack: hex.underAttack
       });
-      await loadTerritories();
       setMessage('Territory updated successfully');
       setTimeout(() => setMessage(''), 3000);
     } catch (error) {
@@ -66,27 +80,32 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
     setLoading(false);
   };
 
-  const createTerritory = async () => {
+  const createTerritory = async (q: number, r: number) => {
     setLoading(true);
     try {
-      const hexId = `hex_${newHex.q}_${newHex.r}`;
+      const hexId = `hex_${q}_${r}`;
       await apiService.createTerritory({
         hex_id: hexId,
-        controlled_by_nation: newHex.nation,
-        is_contested: newHex.isContested,
-        under_attack: newHex.underAttack
+        controlled_by_nation: selectedNation,
+        is_contested: false,
+        under_attack: false
       });
-      await loadTerritories();
-      setNewHex({
-        q: 0,
-        r: 0,
-        nation: 'neutral',
-        name: '',
-        type: 'land',
+      
+      // Add to local state
+      const newHex: HexTile = {
+        id: hexId,
+        q,
+        r,
+        nation: selectedNation,
         isContested: false,
-        underAttack: false
-      });
-      setEditMode('view');
+        units: 0,
+        underAttack: false,
+        name: `Sector ${hexId.replace('hex_', '').toUpperCase()}`,
+        type: selectedType
+      };
+      
+      saveState();
+      setTerritories(prev => [...prev, newHex]);
       setMessage('Territory created successfully');
       setTimeout(() => setMessage(''), 3000);
     } catch (error) {
@@ -102,12 +121,60 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
     setLoading(true);
     try {
       await apiService.deleteTerritory(hexId);
-      await loadTerritories();
+      saveState();
+      setTerritories(prev => prev.filter(h => h.id !== hexId));
       setSelectedHex(null);
       setMessage('Territory deleted successfully');
       setTimeout(() => setMessage(''), 3000);
     } catch (error) {
       setMessage('Failed to delete territory');
+      setTimeout(() => setMessage(''), 3000);
+    }
+    setLoading(false);
+  };
+
+  const bulkEdit = async () => {
+    if (selectedHexes.size === 0) return;
+    
+    setLoading(true);
+    saveState();
+    
+    try {
+      const updates = Array.from(selectedHexes).map(async (hexId) => {
+        const hex = territories.find(h => h.id === hexId);
+        if (!hex) return;
+        
+        let updateData: any = {};
+        
+        if (bulkEditMode === 'nation') {
+          updateData.controlled_by_nation = selectedNation;
+        } else if (bulkEditMode === 'status') {
+          updateData.is_contested = false;
+          updateData.under_attack = false;
+        }
+        
+        return apiService.updateTerritory(hexId, updateData);
+      });
+      
+      await Promise.all(updates);
+      
+      // Update local state
+      setTerritories(prev => prev.map(hex => {
+        if (selectedHexes.has(hex.id)) {
+          if (bulkEditMode === 'nation') {
+            return { ...hex, nation: selectedNation };
+          } else if (bulkEditMode === 'status') {
+            return { ...hex, isContested: false, underAttack: false };
+          }
+        }
+        return hex;
+      }));
+      
+      setSelectedHexes(new Set());
+      setMessage(`Bulk updated ${selectedHexes.size} territories`);
+      setTimeout(() => setMessage(''), 3000);
+    } catch (error) {
+      setMessage('Bulk edit failed');
       setTimeout(() => setMessage(''), 3000);
     }
     setLoading(false);
@@ -129,6 +196,30 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
     setLoading(false);
   };
 
+  const handleHexClick = (hex: HexTile, event: React.MouseEvent) => {
+    if (editMode === 'bulk') {
+      event.stopPropagation();
+      const newSelected = new Set(selectedHexes);
+      if (newSelected.has(hex.id)) {
+        newSelected.delete(hex.id);
+      } else {
+        newSelected.add(hex.id);
+      }
+      setSelectedHexes(newSelected);
+    } else if (editMode === 'edit') {
+      setSelectedHex(hex);
+    } else if (editMode === 'create') {
+      // Create new hex at clicked position
+      const rect = event.currentTarget.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      // Convert pixel to hex coordinates (simplified)
+      const q = Math.round(x / 60) - 10;
+      const r = Math.round(y / 60) - 10;
+      createTerritory(q, r);
+    }
+  };
+
   const nationColors = {
     union: '#3B82F6',
     dominion: '#EF4444',
@@ -137,18 +228,28 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
   };
 
   const getHexColor = (hex: HexTile) => {
+    if (selectedHexes.has(hex.id)) return '#F59E0B'; // Orange for selected
     if (hex.underAttack) return '#DC2626';
     if (hex.isContested) return '#F59E0B';
     return nationColors[hex.nation as keyof typeof nationColors] || nationColors.neutral;
   };
 
+  // Calculate viewBox for the map
+  const minX = Math.min(...territories.map(hex => hexToPixel({ q: hex.q, r: hex.r }).x));
+  const maxX = Math.max(...territories.map(hex => hexToPixel({ q: hex.q, r: hex.r }).x));
+  const minY = Math.min(...territories.map(hex => hexToPixel({ q: hex.q, r: hex.r }).y));
+  const maxY = Math.max(...territories.map(hex => hexToPixel({ q: hex.q, r: hex.r }).y));
+  
+  const padding = HEX_SIZE * 2;
+  const viewBox = `${minX - padding} ${minY - padding} ${maxX - minX + padding * 2} ${maxY - minY + padding * 2}`;
+
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-gray-800 rounded-lg border border-gray-700 w-full max-w-6xl max-h-[90vh] overflow-y-auto">
+      <div className="bg-gray-800 rounded-lg border border-gray-700 w-full max-w-7xl max-h-[95vh] overflow-y-auto">
         <div className="flex items-center justify-between p-6 border-b border-gray-700">
           <h2 className="text-xl font-bold text-white flex items-center">
             <Map className="w-5 h-5 mr-2 text-blue-400" />
-            Map Designer
+            Advanced Map Designer
           </h2>
           <div className="flex items-center space-x-2">
             <button
@@ -179,6 +280,22 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
               Create
             </button>
             <button
+              onClick={() => setEditMode('bulk')}
+              className={`px-3 py-1 rounded text-sm transition-colors ${
+                editMode === 'bulk' ? 'bg-orange-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              }`}
+            >
+              <Layers className="w-3 h-3 inline mr-1" />
+              Bulk
+            </button>
+            <button
+              onClick={undo}
+              disabled={undoStack.length <= 1}
+              className="px-3 py-1 bg-gray-700 text-gray-300 hover:bg-gray-600 disabled:opacity-50 rounded text-sm transition-colors"
+            >
+              ↶ Undo
+            </button>
+            <button
               onClick={onClose}
               className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded-lg transition-colors"
             >
@@ -197,30 +314,34 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
           </div>
         )}
 
-        <div className="p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Map Preview */}
-          <div className="lg:col-span-2">
+        <div className="p-6 grid grid-cols-1 lg:grid-cols-4 gap-6">
+          {/* Enhanced Map Preview */}
+          <div className="lg:col-span-3">
             <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-semibold text-white">Territory Map</h3>
+                <h3 className="text-lg font-semibold text-white">Interactive Territory Map</h3>
                 <div className="flex items-center space-x-2">
-                  <div className="flex items-center space-x-4 text-sm">
-                    <div className="flex items-center space-x-1">
-                      <div className="w-3 h-3 bg-blue-500 rounded-full"></div>
-                      <span className="text-gray-300">Union</span>
-                    </div>
-                    <div className="flex items-center space-x-1">
-                      <div className="w-3 h-3 bg-red-500 rounded-full"></div>
-                      <span className="text-gray-300">Dominion</span>
-                    </div>
-                    <div className="flex items-center space-x-1">
-                      <div className="w-3 h-3 bg-green-500 rounded-full"></div>
-                      <span className="text-gray-300">Syndicate</span>
-                    </div>
-                    <div className="flex items-center space-x-1">
-                      <div className="w-3 h-3 bg-gray-500 rounded-full"></div>
-                      <span className="text-gray-300">Neutral</span>
-                    </div>
+                  <button
+                    onClick={() => setShowGrid(!showGrid)}
+                    className={`px-2 py-1 rounded text-xs ${showGrid ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300'}`}
+                  >
+                    <Grid className="w-3 h-3 inline mr-1" />
+                    Grid
+                  </button>
+                  <div className="flex items-center space-x-1">
+                    <button
+                      onClick={() => setZoom(Math.max(0.5, zoom - 0.1))}
+                      className="px-2 py-1 bg-gray-700 text-gray-300 rounded text-xs"
+                    >
+                      -
+                    </button>
+                    <span className="text-xs text-gray-300 w-12 text-center">{Math.round(zoom * 100)}%</span>
+                    <button
+                      onClick={() => setZoom(Math.min(2, zoom + 0.1))}
+                      className="px-2 py-1 bg-gray-700 text-gray-300 rounded text-xs"
+                    >
+                      +
+                    </button>
                   </div>
                   <button
                     onClick={resetMap}
@@ -233,60 +354,83 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
                 </div>
               </div>
 
-              {/* Simplified hex grid display */}
+              {/* Enhanced SVG Map */}
               <div className="bg-blue-900 rounded-lg p-4 min-h-96 relative overflow-auto">
-                <div className="grid grid-cols-8 gap-1">
-                  {territories.map((hex) => (
-                    <button
-                      key={hex.id}
-                      onClick={() => editMode !== 'create' && setSelectedHex(hex)}
-                      className={`w-12 h-12 rounded-lg border-2 transition-all ${
-                        selectedHex?.id === hex.id 
-                          ? 'border-white scale-110' 
-                          : 'border-gray-600 hover:border-gray-400'
-                      }`}
-                      style={{ backgroundColor: getHexColor(hex) }}
-                      title={`${hex.name} (${hex.q}, ${hex.r})`}
-                    >
-                      <div className="text-xs text-white font-bold">
-                        {hex.q},{hex.r}
-                      </div>
-                    </button>
-                  ))}
-                </div>
+                <svg
+                  viewBox={viewBox}
+                  className="w-full h-96"
+                  style={{ 
+                    background: 'linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%)',
+                    transform: `scale(${zoom})`
+                  }}
+                >
+                  {/* Grid lines */}
+                  {showGrid && (
+                    <defs>
+                      <pattern id="grid" width="60" height="60" patternUnits="userSpaceOnUse">
+                        <path d="M 60 0 L 0 0 0 60" fill="none" stroke="#374151" strokeWidth="0.5" opacity="0.3"/>
+                      </pattern>
+                    </defs>
+                  )}
+                  {showGrid && <rect width="100%" height="100%" fill="url(#grid)" />}
+                  
+                  {/* Hex tiles */}
+                  {territories.map((hex) => {
+                    const center = hexToPixel({ q: hex.q, r: hex.r });
+                    const path = generateHexPath(center, HEX_SIZE);
+                    const color = getHexColor(hex);
+                    const isSelected = selectedHex?.id === hex.id;
+
+                    return (
+                      <g key={hex.id}>
+                        <path
+                          d={path}
+                          fill={color}
+                          fillOpacity={0.7}
+                          stroke={isSelected ? "#FFFFFF" : "#374151"}
+                          strokeWidth={isSelected ? "3" : "1"}
+                          className="cursor-pointer transition-all duration-200 hover:stroke-white hover:stroke-2"
+                          onClick={(e) => handleHexClick(hex, e)}
+                        />
+                        
+                        {/* Hex coordinates */}
+                        <text
+                          x={center.x}
+                          y={center.y}
+                          textAnchor="middle"
+                          className="fill-white text-xs font-bold pointer-events-none"
+                          fontSize="8"
+                        >
+                          {hex.q},{hex.r}
+                        </text>
+                        
+                        {/* Status indicators */}
+                        {hex.isContested && (
+                          <circle cx={center.x + 15} cy={center.y - 15} r="4" fill="#F59E0B" />
+                        )}
+                        {hex.underAttack && (
+                          <circle cx={center.x - 15} cy={center.y - 15} r="4" fill="#DC2626" />
+                        )}
+                      </g>
+                    );
+                  })}
+                </svg>
               </div>
             </div>
           </div>
 
-          {/* Control Panel */}
+          {/* Enhanced Control Panel */}
           <div className="space-y-4">
+            {/* Mode-specific controls */}
             {editMode === 'create' && (
               <div className="bg-gray-700 rounded-lg p-4 border border-gray-600">
                 <h3 className="text-lg font-semibold text-white mb-4">Create New Territory</h3>
                 <div className="space-y-3">
                   <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-1">Q Coordinate</label>
-                    <input
-                      type="number"
-                      value={newHex.q}
-                      onChange={(e) => setNewHex({ ...newHex, q: parseInt(e.target.value) || 0 })}
-                      className="w-full px-3 py-2 bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-1">R Coordinate</label>
-                    <input
-                      type="number"
-                      value={newHex.r}
-                      onChange={(e) => setNewHex({ ...newHex, r: parseInt(e.target.value) || 0 })}
-                      className="w-full px-3 py-2 bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
-                  <div>
                     <label className="block text-sm font-medium text-gray-300 mb-1">Nation</label>
                     <select
-                      value={newHex.nation}
-                      onChange={(e) => setNewHex({ ...newHex, nation: e.target.value as any })}
+                      value={selectedNation}
+                      onChange={(e) => setSelectedNation(e.target.value as any)}
                       className="w-full px-3 py-2 bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
                     >
                       <option value="neutral">Neutral</option>
@@ -295,43 +439,80 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
                       <option value="syndicate">Southern Syndicate</option>
                     </select>
                   </div>
-                  <div className="flex items-center space-x-4">
-                    <label className="flex items-center">
-                      <input
-                        type="checkbox"
-                        checked={newHex.isContested}
-                        onChange={(e) => setNewHex({ ...newHex, isContested: e.target.checked })}
-                        className="mr-2"
-                      />
-                      <span className="text-sm text-gray-300">Contested</span>
-                    </label>
-                    <label className="flex items-center">
-                      <input
-                        type="checkbox"
-                        checked={newHex.underAttack}
-                        onChange={(e) => setNewHex({ ...newHex, underAttack: e.target.checked })}
-                        className="mr-2"
-                      />
-                      <span className="text-sm text-gray-300">Under Attack</span>
-                    </label>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-1">Terrain Type</label>
+                    <select
+                      value={selectedType}
+                      onChange={(e) => setSelectedType(e.target.value as any)}
+                      className="w-full px-3 py-2 bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="land">Land</option>
+                      <option value="water">Water</option>
+                      <option value="mountain">Mountain</option>
+                      <option value="resource">Resource Node</option>
+                    </select>
                   </div>
+                  <div className="text-sm text-gray-400">
+                    Click on the map to create new territories
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {editMode === 'bulk' && (
+              <div className="bg-gray-700 rounded-lg p-4 border border-gray-600">
+                <h3 className="text-lg font-semibold text-white mb-4">Bulk Edit ({selectedHexes.size} selected)</h3>
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-1">Edit Mode</label>
+                    <select
+                      value={bulkEditMode}
+                      onChange={(e) => setBulkEditMode(e.target.value as any)}
+                      className="w-full px-3 py-2 bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="nation">Change Nation</option>
+                      <option value="type">Change Type</option>
+                      <option value="status">Reset Status</option>
+                    </select>
+                  </div>
+                  
+                  {bulkEditMode === 'nation' && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-1">New Nation</label>
+                      <select
+                        value={selectedNation}
+                        onChange={(e) => setSelectedNation(e.target.value as any)}
+                        className="w-full px-3 py-2 bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      >
+                        <option value="neutral">Neutral</option>
+                        <option value="union">Northern Union</option>
+                        <option value="dominion">Eastern Dominion</option>
+                        <option value="syndicate">Southern Syndicate</option>
+                      </select>
+                    </div>
+                  )}
+                  
                   <button
-                    onClick={createTerritory}
-                    disabled={loading}
-                    className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded transition-colors"
+                    onClick={bulkEdit}
+                    disabled={selectedHexes.size === 0 || loading}
+                    className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 text-white rounded transition-colors"
                   >
-                    <Plus className="w-4 h-4 inline mr-2" />
-                    Create Territory
+                    Apply to {selectedHexes.size} territories
+                  </button>
+                  
+                  <button
+                    onClick={() => setSelectedHexes(new Set())}
+                    className="w-full px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded transition-colors"
+                  >
+                    Clear Selection
                   </button>
                 </div>
               </div>
             )}
 
-            {selectedHex && editMode !== 'create' && (
+            {selectedHex && editMode === 'edit' && (
               <div className="bg-gray-700 rounded-lg p-4 border border-gray-600">
-                <h3 className="text-lg font-semibold text-white mb-4">
-                  {editMode === 'edit' ? 'Edit Territory' : 'Territory Details'}
-                </h3>
+                <h3 className="text-lg font-semibold text-white mb-4">Edit Territory</h3>
                 <div className="space-y-3">
                   <div>
                     <label className="block text-sm font-medium text-gray-300 mb-1">Hex ID</label>
@@ -356,8 +537,7 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
                     <select
                       value={selectedHex.nation}
                       onChange={(e) => setSelectedHex({ ...selectedHex, nation: e.target.value as any })}
-                      disabled={editMode !== 'edit'}
-                      className="w-full px-3 py-2 bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:text-gray-400"
+                      className="w-full px-3 py-2 bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
                     >
                       <option value="neutral">Neutral</option>
                       <option value="union">Northern Union</option>
@@ -371,7 +551,6 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
                         type="checkbox"
                         checked={selectedHex.isContested}
                         onChange={(e) => setSelectedHex({ ...selectedHex, isContested: e.target.checked })}
-                        disabled={editMode !== 'edit'}
                         className="mr-2"
                       />
                       <span className="text-sm text-gray-300">Contested</span>
@@ -381,68 +560,92 @@ export function MapDesigner({ onClose }: MapDesignerProps) {
                         type="checkbox"
                         checked={selectedHex.underAttack}
                         onChange={(e) => setSelectedHex({ ...selectedHex, underAttack: e.target.checked })}
-                        disabled={editMode !== 'edit'}
                         className="mr-2"
                       />
                       <span className="text-sm text-gray-300">Under Attack</span>
                     </label>
                   </div>
                   
-                  {editMode === 'edit' && (
-                    <div className="flex space-x-2">
-                      <button
-                        onClick={() => saveTerritory(selectedHex)}
-                        disabled={loading}
-                        className="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded transition-colors"
-                      >
-                        <Save className="w-4 h-4 inline mr-2" />
-                        Save
-                      </button>
-                      <button
-                        onClick={() => deleteTerritory(selectedHex.id)}
-                        disabled={loading}
-                        className="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white rounded transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  )}
+                  <div className="flex space-x-2">
+                    <button
+                      onClick={() => saveTerritory(selectedHex)}
+                      disabled={loading}
+                      className="flex-1 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded transition-colors"
+                    >
+                      <Save className="w-4 h-4 inline mr-2" />
+                      Save
+                    </button>
+                    <button
+                      onClick={() => deleteTerritory(selectedHex.id)}
+                      disabled={loading}
+                      className="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white rounded transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
 
-            {/* Statistics */}
+            {/* Enhanced Statistics */}
             <div className="bg-gray-700 rounded-lg p-4 border border-gray-600">
               <h3 className="text-lg font-semibold text-white mb-4">Map Statistics</h3>
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-300">Total Territories:</span>
-                  <span className="text-white">{territories.length}</span>
+                  <span className="text-white font-bold">{territories.length}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-300">Union:</span>
-                  <span className="text-blue-400">{territories.filter(t => t.nation === 'union').length}</span>
+                  <span className="text-blue-400 font-bold">{territories.filter(t => t.nation === 'union').length}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-300">Dominion:</span>
-                  <span className="text-red-400">{territories.filter(t => t.nation === 'dominion').length}</span>
+                  <span className="text-red-400 font-bold">{territories.filter(t => t.nation === 'dominion').length}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-300">Syndicate:</span>
-                  <span className="text-green-400">{territories.filter(t => t.nation === 'syndicate').length}</span>
+                  <span className="text-green-400 font-bold">{territories.filter(t => t.nation === 'syndicate').length}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-300">Neutral:</span>
-                  <span className="text-gray-400">{territories.filter(t => t.nation === 'neutral').length}</span>
+                  <span className="text-gray-400 font-bold">{territories.filter(t => t.nation === 'neutral').length}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-300">Contested:</span>
-                  <span className="text-yellow-400">{territories.filter(t => t.isContested).length}</span>
+                  <span className="text-yellow-400 font-bold">{territories.filter(t => t.isContested).length}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-300">Under Attack:</span>
-                  <span className="text-red-400">{territories.filter(t => t.underAttack).length}</span>
+                  <span className="text-red-400 font-bold">{territories.filter(t => t.underAttack).length}</span>
                 </div>
+              </div>
+            </div>
+
+            {/* Quick Actions */}
+            <div className="bg-gray-700 rounded-lg p-4 border border-gray-600">
+              <h3 className="text-lg font-semibold text-white mb-4">Quick Actions</h3>
+              <div className="space-y-2">
+                <button
+                  onClick={() => {
+                    saveState();
+                    setTerritories(prev => prev.map(hex => ({ ...hex, isContested: false, underAttack: false })));
+                  }}
+                  className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm transition-colors"
+                >
+                  Clear All Conflicts
+                </button>
+                <button
+                  onClick={() => {
+                    const unionCount = territories.filter(t => t.nation === 'union').length;
+                    const dominionCount = territories.filter(t => t.nation === 'dominion').length;
+                    const syndicateCount = territories.filter(t => t.nation === 'syndicate').length;
+                    alert(`Balance: Union ${unionCount}, Dominion ${dominionCount}, Syndicate ${syndicateCount}`);
+                  }}
+                  className="w-full px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded text-sm transition-colors"
+                >
+                  Check Balance
+                </button>
               </div>
             </div>
           </div>

@@ -1,12 +1,14 @@
 import React, { useState } from 'react';
-import { Activity, Users, MapPin, AlertTriangle, TrendingUp, Send, Globe } from 'lucide-react';
+import { Activity, Users, MapPin, AlertTriangle, TrendingUp, Send, Globe, Package } from 'lucide-react';
 import { useGame } from '../context/GameContext';
 import { DeploymentModal } from '../components/DeploymentModal';
+import { apiService } from '../services/api';
 
 export function DashboardPage() {
-  const { state } = useGame();
+  const { state, refreshPlotData } = useGame();
   const { user, plot, nations } = state;
   const [showDeployment, setShowDeployment] = useState(false);
+  const [collecting, setCollecting] = useState(false);
 
   const userNation = nations.find(n => n.id === user?.nation);
 
@@ -47,6 +49,25 @@ export function DashboardPage() {
     { time: '1 hour ago', action: 'Resources collected', type: 'success' },
     { time: '2 hours ago', action: 'Territory Alpha under attack', type: 'warning' }
   ];
+
+  const handleCollectResources = async () => {
+    if (!plot || collecting) return;
+    
+    setCollecting(true);
+    try {
+      const result = await apiService.collectResources();
+      if (result.success) {
+        await refreshPlotData();
+        // Show success message or notification
+        console.log('Resources collected:', result.collected);
+      }
+    } catch (error) {
+      console.error('Failed to collect resources:', error);
+      // Show error message
+    } finally {
+      setCollecting(false);
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -114,7 +135,8 @@ export function DashboardPage() {
           <div className="space-y-3">
             <button 
               onClick={() => setShowDeployment(true)}
-              className="w-full p-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors text-left"
+              disabled={!plot || plot.troops.filter(t => !t.isTraining && !t.isDeployed && t.count > 0).length === 0}
+              className="w-full p-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors text-left"
             >
               <div className="flex items-center">
                 <Send className="w-4 h-4 mr-2" />
@@ -124,10 +146,23 @@ export function DashboardPage() {
                 </div>
               </div>
             </button>
-            <button className="w-full p-3 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors text-left">
-              <div className="font-medium">Collect Resources</div>
-              <div className="text-sm opacity-90">Gather materials and supplies</div>
+            
+            <button 
+              onClick={handleCollectResources}
+              disabled={!plot || collecting}
+              className="w-full p-3 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors text-left"
+            >
+              <div className="flex items-center">
+                <Package className="w-4 h-4 mr-2" />
+                <div>
+                  <div className="font-medium">
+                    {collecting ? 'Collecting...' : 'Collect Resources'}
+                  </div>
+                  <div className="text-sm opacity-90">Gather materials and supplies</div>
+                </div>
+              </div>
             </button>
+            
             <button className="w-full p-3 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors text-left">
               <div className="font-medium">View Intelligence</div>
               <div className="text-sm opacity-90">Check enemy movements</div>

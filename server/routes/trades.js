@@ -15,7 +15,7 @@ export function createTradeRoutes(pool, authenticateToken) {
         FROM trades t
         JOIN players fp ON t.from_player_id = fp.id
         JOIN players tp ON t.to_player_id = tp.id
-        WHERE t.from_player_id = ? OR t.to_player_id = ?
+        WHERE (t.from_player_id = ? OR t.to_player_id = ?) AND t.expires_at > NOW()
         ORDER BY t.created_at DESC
       `, [playerId, playerId]);
       
@@ -53,10 +53,11 @@ export function createTradeRoutes(pool, authenticateToken) {
   router.get('/players', authenticateToken, async (req, res) => {
     try {
       const [players] = await pool.execute(`
-        SELECT id, username, nation, is_ai
-        FROM players
-        WHERE nation IS NOT NULL
-        ORDER BY is_ai ASC, username ASC
+        SELECT p.id, p.username, p.nation, p.is_ai, pl.manpower, pl.materials, pl.fuel, pl.food
+        FROM players p
+        LEFT JOIN plots pl ON p.plot_id = pl.id
+        WHERE p.nation IS NOT NULL
+        ORDER BY p.is_ai ASC, p.username ASC
       `);
       
       res.json({ players });
@@ -66,7 +67,7 @@ export function createTradeRoutes(pool, authenticateToken) {
     }
   });
 
-  // Create a new trade
+  // Create a new trade - ENHANCED
   router.post('/create', authenticateToken, async (req, res) => {
     try {
       const { toPlayerId, offeredResource, offeredAmount, requestedResource, requestedAmount } = req.body;
@@ -79,6 +80,10 @@ export function createTradeRoutes(pool, authenticateToken) {
       
       if (fromPlayerId === toPlayerId) {
         return res.status(400).json({ error: 'Cannot trade with yourself' });
+      }
+
+      if (offeredAmount <= 0 || requestedAmount <= 0) {
+        return res.status(400).json({ error: 'Trade amounts must be positive' });
       }
       
       // Check if player has enough resources
@@ -95,6 +100,21 @@ export function createTradeRoutes(pool, authenticateToken) {
       if (plot[offeredResource] < offeredAmount) {
         return res.status(400).json({ error: `Insufficient ${offeredResource}` });
       }
+
+      // Check if target player exists and has a plot
+      const [targetPlayerRows] = await pool.execute(
+        'SELECT p.*, pl.* FROM players p LEFT JOIN plots pl ON p.plot_id = pl.id WHERE p.id = ?',
+        [toPlayerId]
+      );
+
+      if (targetPlayerRows.length === 0) {
+        return res.status(404).json({ error: 'Target player not found' });
+      }
+
+      const targetPlayer = targetPlayerRows[0];
+      if (!targetPlayer.plot_id) {
+        return res.status(400).json({ error: 'Target player has no base' });
+      }
       
       // Create trade
       const tradeId = `trade_${Date.now()}_${fromPlayerId}`;
@@ -105,6 +125,8 @@ export function createTradeRoutes(pool, authenticateToken) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `, [tradeId, fromPlayerId, toPlayerId, offeredResource, offeredAmount, requestedResource, requestedAmount, expiresAt]);
       
+      console.log(`Trade created: ${fromPlayerId} offers ${offeredAmount} ${offeredResource} to ${toPlayerId} for ${requestedAmount} ${requestedResource}`);
+      
       res.json({ success: true, tradeId });
     } catch (error) {
       console.error('Create trade error:', error);
@@ -112,7 +134,7 @@ export function createTradeRoutes(pool, authenticateToken) {
     }
   });
 
-  // Accept a trade
+  // Accept a trade - COMPLETELY FIXED
   router.post('/accept', authenticateToken, async (req, res) => {
     try {
       const { tradeId } = req.body;
@@ -122,9 +144,9 @@ export function createTradeRoutes(pool, authenticateToken) {
       await connection.beginTransaction();
       
       try {
-        // Get trade details
+        // Get trade details with lock
         const [tradeRows] = await connection.execute(
-          'SELECT * FROM trades WHERE id = ? AND to_player_id = ? AND status = "pending"',
+          'SELECT * FROM trades WHERE id = ? AND to_player_id = ? AND status = "pending" FOR UPDATE',
           [tradeId, playerId]
         );
         
@@ -147,14 +169,14 @@ export function createTradeRoutes(pool, authenticateToken) {
           return res.status(400).json({ error: 'Trade has expired' });
         }
         
-        // Get both players' plots
+        // Get both players' plots with lock
         const [fromPlotRows] = await connection.execute(
-          'SELECT * FROM plots WHERE player_id = ?',
+          'SELECT * FROM plots WHERE player_id = ? FOR UPDATE',
           [trade.from_player_id]
         );
         
         const [toPlotRows] = await connection.execute(
-          'SELECT * FROM plots WHERE player_id = ?',
+          'SELECT * FROM plots WHERE player_id = ? FOR UPDATE',
           [trade.to_player_id]
         );
         
@@ -180,7 +202,7 @@ export function createTradeRoutes(pool, authenticateToken) {
           return res.status(400).json({ error: 'You have insufficient resources' });
         }
         
-        // Execute the trade
+        // Execute the trade - FIXED RESOURCE EXCHANGE
         await connection.execute(`
           UPDATE plots SET ${trade.offered_resource} = ${trade.offered_resource} - ?, ${trade.requested_resource} = ${trade.requested_resource} + ?
           WHERE player_id = ?
@@ -199,6 +221,8 @@ export function createTradeRoutes(pool, authenticateToken) {
         
         await connection.commit();
         connection.release();
+        
+        console.log(`Trade ${tradeId} completed successfully`);
         
         res.json({ success: true });
       } catch (error) {
@@ -226,6 +250,8 @@ export function createTradeRoutes(pool, authenticateToken) {
       if (result.affectedRows === 0) {
         return res.status(404).json({ error: 'Trade not found or not available' });
       }
+      
+      console.log(`Trade ${tradeId} rejected by player ${playerId}`);
       
       res.json({ success: true });
     } catch (error) {

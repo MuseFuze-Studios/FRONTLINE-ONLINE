@@ -79,6 +79,176 @@ const requireAdmin = async (req, res, next) => {
   }
 };
 
+// Helper function to recalculate population
+async function recalculatePopulation(plotId) {
+  try {
+    // Get all troops for this plot (excluding those being trained)
+    const [troops] = await pool.execute(
+      'SELECT SUM(count) as total_troops FROM troops WHERE plot_id = ? AND is_training = FALSE',
+      [plotId]
+    );
+    
+    // Get housing count for population cap
+    const [housing] = await pool.execute(
+      'SELECT COUNT(*) as housing_count FROM buildings WHERE plot_id = ? AND type = "housing" AND is_under_construction = FALSE',
+      [plotId]
+    );
+    
+    const totalTroops = troops[0].total_troops || 0;
+    const housingCount = housing[0].housing_count || 0;
+    const populationCap = 50 + (housingCount * 25);
+    
+    // Update the plot with correct population
+    await pool.execute(
+      'UPDATE plots SET population_current = ?, population_cap = ? WHERE id = ?',
+      [totalTroops, populationCap, plotId]
+    );
+    
+    return { current: totalTroops, cap: populationCap };
+  } catch (error) {
+    console.error('Population recalculation error:', error);
+    return null;
+  }
+}
+
+// Process completed deployments with combat resolution
+async function processCompletedDeployments() {
+  try {
+    // Fixed SQL query - use correct table aliases
+    const [completedActions] = await pool.execute(`
+      SELECT pa.*, pl.nation as attacker_nation, p.id as attacker_plot_id
+      FROM player_actions pa
+      JOIN players pl ON pa.player_id = pl.id
+      JOIN plots p ON pl.plot_id = p.id
+      WHERE pa.status = 'in_progress' AND pa.completes_at <= NOW()
+    `);
+
+    for (const action of completedActions) {
+      try {
+        // Parse troop data safely
+        let troopData = {};
+        if (action.troop_data) {
+          try {
+            troopData = typeof action.troop_data === 'string' 
+              ? JSON.parse(action.troop_data) 
+              : action.troop_data;
+          } catch (parseError) {
+            console.error('Failed to parse troop data:', parseError);
+            troopData = { totalUnits: 1, totalStrength: 10 };
+          }
+        }
+
+        // Get or create target territory
+        let [territoryRows] = await pool.execute(
+          'SELECT * FROM territories WHERE hex_id = ?',
+          [action.to_hex]
+        );
+
+        if (territoryRows.length === 0) {
+          // Create neutral territory if it doesn't exist
+          const territoryId = `territory_${Date.now()}_${action.to_hex}`;
+          await pool.execute(`
+            INSERT INTO territories (id, hex_id, controlled_by_nation, is_contested, under_attack)
+            VALUES (?, ?, 'neutral', FALSE, FALSE)
+          `, [territoryId, action.to_hex]);
+          
+          // Fetch the newly created territory
+          [territoryRows] = await pool.execute(
+            'SELECT * FROM territories WHERE hex_id = ?',
+            [action.to_hex]
+          );
+        }
+
+        const territory = territoryRows[0];
+        
+        // Combat resolution based on action type
+        if (action.action_type === 'attack') {
+          if (territory.controlled_by_nation === 'neutral') {
+            // Capture neutral territory
+            await pool.execute(`
+              UPDATE territories SET 
+                controlled_by_nation = ?, 
+                controlled_by_player = ?,
+                is_contested = FALSE,
+                under_attack = FALSE
+              WHERE hex_id = ?
+            `, [action.attacker_nation, action.player_id, action.to_hex]);
+            
+            console.log(`Territory ${action.to_hex} captured by ${action.attacker_nation}`);
+          } else if (territory.controlled_by_nation !== action.attacker_nation) {
+            // Attack enemy territory - resolve combat
+            const attackerStrength = troopData.totalStrength || 10;
+            const defenderStrength = Math.floor(Math.random() * 20) + 5; // Random defender strength
+            
+            // Combat calculation with defensive bonus
+            const attackerPower = attackerStrength;
+            const defenderPower = Math.floor(defenderStrength * 1.2); // 20% defensive bonus
+            
+            if (attackerPower > defenderPower) {
+              // Attacker wins - capture territory
+              await pool.execute(`
+                UPDATE territories SET 
+                  controlled_by_nation = ?, 
+                  controlled_by_player = ?,
+                  is_contested = FALSE,
+                  under_attack = FALSE
+                WHERE hex_id = ?
+              `, [action.attacker_nation, action.player_id, action.to_hex]);
+              
+              console.log(`Territory ${action.to_hex} conquered by ${action.attacker_nation}`);
+            } else {
+              // Defender wins - mark as contested
+              await pool.execute(`
+                UPDATE territories SET 
+                  is_contested = TRUE,
+                  under_attack = FALSE
+                WHERE hex_id = ?
+              `, [action.to_hex]);
+              
+              console.log(`Attack on ${action.to_hex} repelled - territory contested`);
+            }
+          }
+        } else if (action.action_type === 'occupy') {
+          // Reinforce friendly or neutral territory
+          if (territory.controlled_by_nation === action.attacker_nation || territory.controlled_by_nation === 'neutral') {
+            await pool.execute(`
+              UPDATE territories SET 
+                controlled_by_nation = ?, 
+                controlled_by_player = ?,
+                is_contested = FALSE,
+                under_attack = FALSE
+              WHERE hex_id = ?
+            `, [action.attacker_nation, action.player_id, action.to_hex]);
+            
+            console.log(`Territory ${action.to_hex} reinforced by ${action.attacker_nation}`);
+          }
+        }
+
+        // Mark action as completed
+        await pool.execute(
+          'UPDATE player_actions SET status = "completed" WHERE id = ?',
+          [action.id]
+        );
+
+      } catch (actionError) {
+        console.error(`Error processing action ${action.id}:`, actionError);
+        // Mark action as failed
+        await pool.execute(
+          'UPDATE player_actions SET status = "cancelled" WHERE id = ?',
+          [action.id]
+        );
+      }
+    }
+
+    if (completedActions.length > 0) {
+      console.log(`Processed ${completedActions.length} completed deployments`);
+    }
+
+  } catch (error) {
+    console.error('Process completed deployments error:', error);
+  }
+}
+
 // Generate balanced territories for each faction
 function generateBalancedTerritories() {
   const territories = [];
@@ -163,6 +333,12 @@ async function createAIPlayers() {
             INSERT INTO plots (id, player_id, nation, hex_id, resource_specialization, population_cap)
             VALUES (?, ?, ?, ?, ?, ?)
           `, [plotId, result.insertId, nation, `hex_ai_${Math.random().toString(36).substr(2, 9)}`, specialization, 50]);
+
+          // Update player with plot_id
+          await pool.execute(
+            'UPDATE players SET plot_id = ? WHERE id = ?',
+            [plotId, result.insertId]
+          );
 
           // Create AI headquarters
           await pool.execute(`
@@ -409,7 +585,7 @@ const { broadcastUpdate, broadcastToAll } = setupWebSocket(server, JWT_SECRET);
 // Setup routes
 app.use('/api/auth', createAuthRoutes(pool, JWT_SECRET));
 app.use('/api/trades', createTradeRoutes(pool, authenticateToken));
-app.use('/api/admin', createAdminRoutes(pool, gameSettings, requireAdmin, generateBalancedTerritories, createAIPlayers));
+app.use('/api/admin', createAdminRoutes(pool, gameSettings, authenticateToken, requireAdmin, generateBalancedTerritories, createAIPlayers));
 
 // Game data routes
 app.get('/api/game/territories', async (req, res) => {
@@ -495,17 +671,31 @@ app.get('/api/player/actions', authenticateToken, async (req, res) => {
     `);
     
     res.json({ 
-      actions: actions.map(action => ({
-        id: action.id,
-        playerId: action.player_id,
-        actionType: action.action_type,
-        fromHex: action.from_hex,
-        toHex: action.to_hex,
-        troopData: action.troop_data ? JSON.parse(action.troop_data) : null,
-        startedAt: new Date(action.started_at).getTime(),
-        completesAt: new Date(action.completes_at).getTime(),
-        status: action.status
-      }))
+      actions: actions.map(action => {
+        let troopData = null;
+        if (action.troop_data) {
+          try {
+            troopData = typeof action.troop_data === 'string' 
+              ? JSON.parse(action.troop_data) 
+              : action.troop_data;
+          } catch (error) {
+            console.error('Error parsing troop data for action', action.id, ':', error);
+            troopData = { totalUnits: 1, totalStrength: 10 };
+          }
+        }
+        
+        return {
+          id: action.id,
+          playerId: action.player_id,
+          actionType: action.action_type,
+          fromHex: action.from_hex,
+          toHex: action.to_hex,
+          troopData: troopData,
+          startedAt: new Date(action.started_at).getTime(),
+          completesAt: new Date(action.completes_at).getTime(),
+          status: action.status
+        };
+      })
     });
   } catch (error) {
     console.error('Get player actions error:', error);
@@ -538,6 +728,64 @@ app.get('/api/game/battle-stats', async (req, res) => {
   } catch (error) {
     console.error('Get battle stats error:', error);
     res.status(500).json({ error: 'Failed to get battle stats' });
+  }
+});
+
+// Collect resources route
+app.post('/api/player/collect-resources', authenticateToken, async (req, res) => {
+  try {
+    const playerId = req.user.id;
+    
+    // Get player plot
+    const [plotRows] = await pool.execute(
+      'SELECT * FROM plots WHERE player_id = ?',
+      [playerId]
+    );
+    
+    if (plotRows.length === 0) {
+      return res.status(404).json({ error: 'Plot not found' });
+    }
+    
+    const plot = plotRows[0];
+    
+    // Calculate bonus resources (10% of current resources)
+    const bonusManpower = Math.floor(plot.manpower * 0.1);
+    const bonusMaterials = Math.floor(plot.materials * 0.1);
+    const bonusFuel = Math.floor(plot.fuel * 0.1);
+    const bonusFood = Math.floor(plot.food * 0.1);
+    
+    // Get storage capacity
+    const [storageRows] = await pool.execute(
+      'SELECT COUNT(*) as storage_count FROM buildings WHERE plot_id = ? AND type = "storage" AND is_under_construction = FALSE',
+      [plot.id]
+    );
+    
+    const storageCap = 1000 + (storageRows[0].storage_count * 500);
+    
+    // Apply bonus resources with storage cap
+    const newManpower = Math.min(storageCap, plot.manpower + bonusManpower);
+    const newMaterials = Math.min(storageCap, plot.materials + bonusMaterials);
+    const newFuel = Math.min(storageCap, plot.fuel + bonusFuel);
+    const newFood = Math.min(storageCap, plot.food + bonusFood);
+    
+    await pool.execute(`
+      UPDATE plots SET 
+        manpower = ?, materials = ?, fuel = ?, food = ?
+      WHERE id = ?
+    `, [newManpower, newMaterials, newFuel, newFood, plot.id]);
+    
+    res.json({ 
+      success: true, 
+      collected: {
+        manpower: bonusManpower,
+        materials: bonusMaterials,
+        fuel: bonusFuel,
+        food: bonusFood
+      }
+    });
+  } catch (error) {
+    console.error('Collect resources error:', error);
+    res.status(500).json({ error: 'Failed to collect resources' });
   }
 });
 
@@ -803,6 +1051,86 @@ app.post('/api/buildings/construct', authenticateToken, async (req, res) => {
   }
 });
 
+// Building upgrade route - NEW
+app.post('/api/buildings/upgrade', authenticateToken, async (req, res) => {
+  try {
+    const { buildingId } = req.body;
+    const playerId = req.user.id;
+    
+    // Get building and verify ownership
+    const [buildingRows] = await pool.execute(`
+      SELECT b.*, p.player_id, p.materials 
+      FROM buildings b
+      JOIN plots p ON b.plot_id = p.id
+      WHERE b.id = ? AND p.player_id = ?
+    `, [buildingId, playerId]);
+    
+    if (buildingRows.length === 0) {
+      return res.status(404).json({ error: 'Building not found' });
+    }
+    
+    const building = buildingRows[0];
+    
+    // Check if building can be upgraded
+    if (building.is_under_construction || building.is_upgrading) {
+      return res.status(400).json({ error: 'Building is already under construction or upgrading' });
+    }
+    
+    if (building.level >= building.max_level) {
+      return res.status(400).json({ error: 'Building is already at maximum level' });
+    }
+    
+    // Calculate upgrade cost (increases with level)
+    const upgradeCost = Math.floor(30 * Math.pow(1.5, building.level));
+    
+    if (building.materials < upgradeCost) {
+      return res.status(400).json({ error: 'Insufficient materials for upgrade' });
+    }
+    
+    // Calculate upgrade time (2 minutes base + 30 seconds per level)
+    const upgradeTime = 120000 + (building.level * 30000);
+    const upgradeEnd = new Date(Date.now() + upgradeTime);
+    
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    
+    try {
+      // Deduct resources
+      await connection.execute(
+        'UPDATE plots SET materials = materials - ? WHERE player_id = ?',
+        [upgradeCost, playerId]
+      );
+      
+      // Start upgrade
+      await connection.execute(`
+        UPDATE buildings SET 
+          is_upgrading = TRUE,
+          upgrade_end = ?
+        WHERE id = ?
+      `, [upgradeEnd, buildingId]);
+      
+      await connection.commit();
+      connection.release();
+      
+      // Broadcast update to player
+      broadcastUpdate(playerId, { type: 'plot_update' });
+      
+      res.json({ 
+        success: true, 
+        upgradeEnd: upgradeEnd.getTime(),
+        cost: upgradeCost
+      });
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
+  } catch (error) {
+    console.error('Upgrade error:', error);
+    res.status(500).json({ error: 'Upgrade failed' });
+  }
+});
+
 // Train troops
 app.post('/api/troops/train', authenticateToken, async (req, res) => {
   try {
@@ -912,9 +1240,124 @@ app.post('/api/troops/train', authenticateToken, async (req, res) => {
   }
 });
 
-// Setup timers and AI
+// Deploy troops - ENHANCED
+app.post('/api/troops/deploy', authenticateToken, async (req, res) => {
+  try {
+    const { troops, targetHex, type } = req.body;
+    const playerId = req.user.id;
+    
+    if (!troops || troops.length === 0) {
+      return res.status(400).json({ error: 'No troops selected for deployment' });
+    }
+    
+    // Get player plot and nation
+    const [plotRows] = await pool.execute(`
+      SELECT p.*, pl.nation 
+      FROM plots p
+      JOIN players pl ON p.player_id = pl.id
+      WHERE p.player_id = ?
+    `, [playerId]);
+    
+    if (plotRows.length === 0) {
+      return res.status(404).json({ error: 'Plot not found' });
+    }
+    
+    const plot = plotRows[0];
+    
+    // Validate troop deployment
+    let totalUnits = 0;
+    let totalStrength = 0;
+    
+    for (const troopDeployment of troops) {
+      const [troopRows] = await pool.execute(
+        'SELECT * FROM troops WHERE id = ? AND plot_id = ? AND is_training = FALSE AND is_deployed = FALSE',
+        [troopDeployment.troopId, plot.id]
+      );
+      
+      if (troopRows.length === 0) {
+        return res.status(400).json({ error: `Troop ${troopDeployment.troopId} not available for deployment` });
+      }
+      
+      const troop = troopRows[0];
+      if (troop.count < troopDeployment.count) {
+        return res.status(400).json({ error: `Insufficient ${troop.name} units` });
+      }
+      
+      totalUnits += troopDeployment.count;
+      totalStrength += troop.strength * troopDeployment.count;
+    }
+    
+    // Calculate deployment time (5-15 minutes based on distance)
+    const deploymentTime = Math.floor(Math.random() * 600000) + 300000; // 5-15 minutes
+    const deploymentEnd = new Date(Date.now() + deploymentTime);
+    
+    // Create player action
+    const actionId = `action_${Date.now()}_${playerId}`;
+    const troopData = {
+      totalUnits,
+      totalStrength,
+      deployedTroops: troops
+    };
+    
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    
+    try {
+      // Create player action
+      await connection.execute(`
+        INSERT INTO player_actions (id, player_id, action_type, from_hex, to_hex, troop_data, completes_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [actionId, playerId, type === 'attack' ? 'attack' : 'occupy', plot.hex_id, targetHex, JSON.stringify(troopData), deploymentEnd]);
+      
+      // Mark troops as deployed
+      for (const troopDeployment of troops) {
+        await connection.execute(`
+          UPDATE troops SET 
+            count = count - ?,
+            is_deployed = TRUE,
+            deployment_end = ?,
+            target_hex = ?
+          WHERE id = ?
+        `, [troopDeployment.count, deploymentEnd, targetHex, troopDeployment.troopId]);
+      }
+      
+      // Update population
+      await connection.execute(
+        'UPDATE plots SET population_current = population_current - ? WHERE id = ?',
+        [totalUnits, plot.id]
+      );
+      
+      await connection.commit();
+      connection.release();
+      
+      // Broadcast update to player
+      broadcastUpdate(playerId, { type: 'plot_update' });
+      broadcastToAll({ type: 'map_update' }); // Notify all players of new movement
+      
+      res.json({ 
+        success: true, 
+        actionId,
+        deploymentEnd: deploymentEnd.getTime(),
+        totalUnits,
+        totalStrength
+      });
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
+  } catch (error) {
+    console.error('Deploy troops error:', error);
+    res.status(500).json({ error: 'Deployment failed' });
+  }
+});
+
+// Setup timers and AI with deployment processing
 setupTimers(pool, gameSettings, broadcastToAll);
 setupAI(pool, gameSettings, broadcastToAll);
+
+// Start deployment processing timer
+setInterval(processCompletedDeployments, 30000); // Check every 30 seconds
 
 const PORT = process.env.PORT || 3001;
 

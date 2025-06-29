@@ -2,9 +2,9 @@ import express from 'express';
 
 const router = express.Router();
 
-export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBalancedTerritories, createAIPlayers) {
+export function createAdminRoutes(pool, gameSettings, authenticateToken, requireAdmin, generateBalancedTerritories, createAIPlayers) {
   // Get admin settings
-  router.get('/settings', requireAdmin, async (req, res) => {
+  router.get('/settings', authenticateToken, requireAdmin, async (req, res) => {
     try {
       res.json({ settings: gameSettings });
     } catch (error) {
@@ -14,7 +14,7 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
   });
 
   // Update admin settings
-  router.post('/settings', requireAdmin, async (req, res) => {
+  router.post('/settings', authenticateToken, requireAdmin, async (req, res) => {
     try {
       const { settings } = req.body;
       Object.assign(gameSettings, settings);
@@ -26,7 +26,7 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
   });
 
   // Soft wipe
-  router.post('/soft-wipe', requireAdmin, async (req, res) => {
+  router.post('/soft-wipe', authenticateToken, requireAdmin, async (req, res) => {
     try {
       const connection = await pool.getConnection();
       await connection.beginTransaction();
@@ -72,32 +72,60 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
     }
   });
 
-  // Hard wipe
-  router.post('/hard-wipe', requireAdmin, async (req, res) => {
+  // FIXED Hard wipe
+  router.post('/hard-wipe', authenticateToken, requireAdmin, async (req, res) => {
     try {
       const connection = await pool.getConnection();
       await connection.beginTransaction();
       
       try {
-        // Delete all non-admin players and their data
+        // Delete all player actions first (foreign key constraint)
+        await connection.execute(`DELETE FROM player_actions`);
+        
+        // Delete all trades
+        await connection.execute(`DELETE FROM trades`);
+        
+        // Delete all supply convoys
+        await connection.execute(`DELETE FROM supply_convoys`);
+        
+        // Delete all construction queue items
+        await connection.execute(`DELETE FROM construction_queue`);
+        
+        // Delete all troops
+        await connection.execute(`DELETE FROM troops`);
+        
+        // Delete all buildings
+        await connection.execute(`DELETE FROM buildings`);
+        
+        // Delete all plots
+        await connection.execute(`DELETE FROM plots`);
+        
+        // Delete all non-admin players
         await connection.execute(`DELETE FROM players WHERE role != 'admin'`);
         
-        // Reset territories
-        await connection.execute(`
-          UPDATE territories SET 
-            controlled_by_nation = 'neutral',
-            controlled_by_player = NULL,
-            is_contested = FALSE,
-            under_attack = FALSE
-        `);
+        // Reset territories to balanced distribution
+        await connection.execute(`DELETE FROM territories`);
         
         await connection.commit();
         connection.release();
         
+        // Regenerate balanced territories
+        const territories = generateBalancedTerritories();
+        const territoryConnection = await pool.getConnection();
+        
+        for (const territory of territories) {
+          await territoryConnection.execute(`
+            INSERT INTO territories (id, hex_id, controlled_by_nation, is_contested, under_attack)
+            VALUES (?, ?, ?, FALSE, FALSE)
+          `, [territory.id, territory.hex_id, territory.nation]);
+        }
+        
+        territoryConnection.release();
+        
         // Recreate AI players
         await createAIPlayers();
         
-        res.json({ success: true, message: 'Hard wipe completed successfully' });
+        res.json({ success: true, message: 'Hard wipe completed successfully - all player data reset' });
       } catch (error) {
         await connection.rollback();
         connection.release();
@@ -109,8 +137,8 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
     }
   });
 
-  // Reset map
-  router.post('/reset-map', requireAdmin, async (req, res) => {
+  // IMPROVED Reset map
+  router.post('/reset-map', authenticateToken, requireAdmin, async (req, res) => {
     try {
       const connection = await pool.getConnection();
       await connection.beginTransaction();
@@ -119,7 +147,7 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
         // Clear existing territories
         await connection.execute('DELETE FROM territories');
         
-        // Generate new balanced territories
+        // Generate new balanced territories with improved distribution
         const territories = generateBalancedTerritories();
         
         // Insert new territories
@@ -133,7 +161,11 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
         await connection.commit();
         connection.release();
         
-        res.json({ success: true, message: 'Map reset with even faction distribution completed' });
+        res.json({ 
+          success: true, 
+          message: `Map reset completed - ${territories.length} territories with balanced faction distribution`,
+          territories: territories.length
+        });
       } catch (error) {
         await connection.rollback();
         connection.release();
@@ -146,7 +178,7 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
   });
 
   // Territory management
-  router.put('/territory/:hexId', requireAdmin, async (req, res) => {
+  router.put('/territory/:hexId', authenticateToken, requireAdmin, async (req, res) => {
     try {
       const { hexId } = req.params;
       const { controlled_by_nation, is_contested, under_attack } = req.body;
@@ -166,7 +198,7 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
     }
   });
 
-  router.post('/territory', requireAdmin, async (req, res) => {
+  router.post('/territory', authenticateToken, requireAdmin, async (req, res) => {
     try {
       const { hex_id, controlled_by_nation, is_contested, under_attack } = req.body;
       const territoryId = `territory_${Date.now()}`;
@@ -183,7 +215,7 @@ export function createAdminRoutes(pool, gameSettings, requireAdmin, generateBala
     }
   });
 
-  router.delete('/territory/:hexId', requireAdmin, async (req, res) => {
+  router.delete('/territory/:hexId', authenticateToken, requireAdmin, async (req, res) => {
     try {
       const { hexId } = req.params;
       

@@ -88,6 +88,13 @@ class ApiService {
     return this.request('/player/plot');
   }
 
+  // NEW: Collect resources
+  async collectResources() {
+    return this.request('/player/collect-resources', {
+      method: 'POST',
+    });
+  }
+
   // Game data methods
   async getTerritories() {
     return this.request('/game/territories');

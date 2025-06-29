@@ -312,14 +312,14 @@ export function GameProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // Real-time sync with server
+  // Real-time sync with server - more frequent updates
   useEffect(() => {
     const interval = setInterval(() => {
       if (state.token) {
         refreshPlotData();
         refreshGameData();
       }
-    }, 30000); // Sync every 30 seconds
+    }, 10000); // Sync every 10 seconds for more responsive updates
 
     return () => clearInterval(interval);
   }, [state.token]);

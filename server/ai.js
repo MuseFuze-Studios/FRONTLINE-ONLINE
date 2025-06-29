@@ -1,4 +1,4 @@
-// AI Player Logic System
+// Enhanced AI Player Logic System
 export function setupAI(pool, gameSettings, broadcastToAll) {
   
   // AI decision making logic
@@ -22,7 +22,7 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
     // AI resource management
     await manageAIResources(ai);
     
-    // AI trading decisions
+    // AI trading decisions - IMPROVED
     await makeAITrades(ai);
     
     // AI building decisions
@@ -33,16 +33,16 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
   }
 
   async function manageAIResources(ai) {
-    // Check if AI needs resources
+    // Check if AI needs resources - IMPROVED FOOD LOGIC
     const resourceNeeds = {
-      manpower: ai.manpower < 50,
-      materials: ai.materials < 30,
-      fuel: ai.fuel < 20,
-      food: ai.food < 25
+      manpower: ai.manpower < 100,
+      materials: ai.materials < 60,
+      fuel: ai.fuel < 40,
+      food: ai.food < 80 // INCREASED food threshold
     };
 
     // If AI has surplus of specialized resource, consider trading
-    const surplus = ai[ai.resource_specialization] > 200;
+    const surplus = ai[ai.resource_specialization] > 300; // INCREASED surplus threshold
     if (surplus) {
       const neededResource = Object.keys(resourceNeeds).find(r => resourceNeeds[r] && r !== ai.resource_specialization);
       if (neededResource) {
@@ -53,32 +53,33 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
 
   async function createAITrade(ai, neededResource) {
     try {
-      // Find potential trading partners
+      // Find potential trading partners - IMPROVED LOGIC
       const [potentialPartners] = await pool.execute(`
-        SELECT p.id, pl.${neededResource} as resource_amount
+        SELECT p.id, p.username, p.is_ai, pl.${neededResource} as resource_amount
         FROM players p
         JOIN plots pl ON p.plot_id = pl.id
-        WHERE p.id != ? AND pl.${neededResource} > 100
-        ORDER BY pl.${neededResource} DESC
-        LIMIT 5
+        WHERE p.id != ? AND pl.${neededResource} > 150
+        ORDER BY p.is_ai ASC, pl.${neededResource} DESC
+        LIMIT 10
       `, [ai.id]);
 
       if (potentialPartners.length === 0) return;
 
-      const partner = potentialPartners[0];
-      const offeredAmount = Math.min(50, Math.floor(ai[ai.resource_specialization] * 0.3));
-      const requestedAmount = Math.min(30, Math.floor(partner.resource_amount * 0.2));
+      // Prefer trading with human players for better engagement
+      const partner = potentialPartners.find(p => !p.is_ai) || potentialPartners[0];
+      const offeredAmount = Math.min(100, Math.floor(ai[ai.resource_specialization] * 0.4)); // INCREASED offer
+      const requestedAmount = Math.min(60, Math.floor(partner.resource_amount * 0.3)); // INCREASED request
 
       // Create trade offer
       const tradeId = `ai_trade_${Date.now()}_${ai.id}`;
-      const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000); // 12 hours
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
       await pool.execute(`
         INSERT INTO trades (id, from_player_id, to_player_id, offered_resource, offered_amount, requested_resource, requested_amount, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `, [tradeId, ai.id, partner.id, ai.resource_specialization, offeredAmount, neededResource, requestedAmount, expiresAt]);
 
-      console.log(`AI ${ai.username} created trade: ${offeredAmount} ${ai.resource_specialization} for ${requestedAmount} ${neededResource}`);
+      console.log(`AI ${ai.username} created trade: ${offeredAmount} ${ai.resource_specialization} for ${requestedAmount} ${neededResource} with ${partner.username}`);
     } catch (error) {
       console.error('AI trade creation error:', error);
     }
@@ -102,19 +103,21 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
 
       const hasBuilding = (type) => buildings.some(b => b.type === type);
 
-      // AI building priority logic
+      // IMPROVED AI building priority logic
       let buildingToBuild = null;
 
       if (!hasBuilding('barracks') && ai.materials >= 30) {
         buildingToBuild = 'barracks';
+      } else if (!hasBuilding('farm') && ai.materials >= 35) { // PRIORITIZE FOOD
+        buildingToBuild = 'farm';
       } else if (!hasBuilding('industry') && ai.materials >= 60) {
         buildingToBuild = 'industry';
-      } else if (!hasBuilding('farm') && ai.materials >= 35) {
-        buildingToBuild = 'farm';
       } else if (!hasBuilding('housing') && ai.materials >= 45) {
         buildingToBuild = 'housing';
       } else if (!hasBuilding('storage') && ai.materials >= 30) {
         buildingToBuild = 'storage';
+      } else if (!hasBuilding('infrastructure') && ai.materials >= 80) {
+        buildingToBuild = 'infrastructure';
       }
 
       if (buildingToBuild) {
@@ -132,7 +135,8 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
         industry: { name: 'AI Industrial Complex', time: 300000, cost: 60 },
         farm: { name: 'AI Agricultural Center', time: 150000, cost: 35 },
         housing: { name: 'AI Housing Complex', time: 200000, cost: 45 },
-        storage: { name: 'AI Storage Facility', time: 120000, cost: 30 }
+        storage: { name: 'AI Storage Facility', time: 120000, cost: 30 },
+        infrastructure: { name: 'AI Infrastructure Node', time: 360000, cost: 80 }
       };
 
       const config = buildingConfigs[buildingType];
@@ -198,13 +202,20 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
       // Check population capacity
       if (ai.population_current >= ai.population_cap) return;
 
-      // AI prefers infantry early, then diversifies
+      // IMPROVED AI troop strategy - considers food availability
       const troopTypes = ['infantry', 'armor', 'artillery'];
       const troopCosts = { infantry: 15, armor: 25, artillery: 35 };
+      const troopUpkeep = { infantry: { food: 1, fuel: 0 }, armor: { food: 0, fuel: 1 }, artillery: { food: 1, fuel: 1 } };
 
       for (const troopType of troopTypes) {
         const cost = troopCosts[troopType];
-        if (ai.manpower >= cost * 2) { // Train 2 units
+        const upkeep = troopUpkeep[troopType];
+        
+        // Check if AI can afford both cost and upkeep
+        const canAffordCost = ai.manpower >= cost * 2;
+        const canAffordUpkeep = ai.food >= upkeep.food * 10 && ai.fuel >= upkeep.fuel * 10;
+        
+        if (canAffordCost && canAffordUpkeep) {
           await startAITroopTraining(ai, troopType, 2);
           break;
         }
@@ -278,7 +289,7 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
     }
   }
 
-  // AI accepts incoming trades based on logic
+  // IMPROVED AI trade response logic
   async function processAITradeResponses() {
     try {
       const [incomingTrades] = await pool.execute(`
@@ -293,7 +304,7 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
         
         if (shouldAccept) {
           await acceptAITrade(trade);
-        } else if (Math.random() < 0.1) { // 10% chance to reject
+        } else if (Math.random() < 0.15) { // 15% chance to reject (increased engagement)
           await rejectAITrade(trade);
         }
       }
@@ -303,16 +314,31 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
   }
 
   function evaluateTradeForAI(trade) {
-    // AI accepts if:
-    // 1. They need the offered resource
-    // 2. They have surplus of requested resource
-    // 3. The trade ratio is reasonable
+    // IMPROVED AI trade evaluation logic
+    // 1. Check if AI desperately needs the offered resource
+    const desperatelyNeeds = trade[trade.offered_resource] < 50;
     
-    const aiNeedsOffered = trade[trade.offered_resource] < 50;
-    const aiHasSurplus = trade[trade.requested_resource] > 100;
-    const reasonableRatio = trade.offered_amount >= trade.requested_amount * 0.8;
+    // 2. Check if AI has surplus of requested resource
+    const hasSurplus = trade[trade.requested_resource] > 200;
     
-    return aiNeedsOffered && aiHasSurplus && reasonableRatio;
+    // 3. Check if the trade ratio is reasonable (more flexible for food)
+    let reasonableRatio;
+    if (trade.offered_resource === 'food' || trade.requested_resource === 'food') {
+      reasonableRatio = trade.offered_amount >= trade.requested_amount * 0.6; // More favorable for food trades
+    } else {
+      reasonableRatio = trade.offered_amount >= trade.requested_amount * 0.8;
+    }
+    
+    // 4. Special consideration for food trades (AI prioritizes food)
+    const foodTrade = trade.offered_resource === 'food' || trade.requested_resource === 'food';
+    const needsFood = trade.food < 100;
+    
+    if (foodTrade && needsFood && trade.offered_resource === 'food') {
+      return true; // Always accept food when needed
+    }
+    
+    return (desperatelyNeeds && hasSurplus && reasonableRatio) || 
+           (foodTrade && reasonableRatio && hasSurplus);
   }
 
   async function acceptAITrade(trade) {
@@ -321,7 +347,7 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
       await connection.beginTransaction();
 
       try {
-        // Execute the trade
+        // Execute the trade - FIXED RESOURCE EXCHANGE
         await connection.execute(`
           UPDATE plots SET ${trade.offered_resource} = ${trade.offered_resource} - ?, ${trade.requested_resource} = ${trade.requested_resource} + ?
           WHERE player_id = ?
@@ -364,11 +390,11 @@ export function setupAI(pool, gameSettings, broadcastToAll) {
     }
   }
 
-  // Run AI decisions every 5 minutes
+  // Run AI decisions every 3 minutes (more frequent)
   const aiInterval = setInterval(async () => {
     await makeAIDecisions();
     await processAITradeResponses();
-  }, 300000); // 5 minutes
+  }, 180000); // 3 minutes
 
   return aiInterval;
 }

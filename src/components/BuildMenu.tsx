@@ -4,11 +4,13 @@ import { useGame } from '../context/GameContext';
 import { Building as BuildingType } from '../types/game';
 import { BuildQueue } from './BuildQueue';
 import { TimerDisplay } from './TimerDisplay';
+import { apiService } from '../services/api';
 
 export function BuildMenu() {
-  const { state, startBuilding, upgradeBuilding } = useGame();
+  const { state, startBuilding, refreshPlotData } = useGame();
   const plot = state.plot;
   const [selectedBuilding, setSelectedBuilding] = useState<BuildingType['type'] | null>(null);
+  const [upgrading, setUpgrading] = useState<string | null>(null);
 
   if (!plot) {
     return (
@@ -156,6 +158,22 @@ export function BuildMenu() {
     const success = await startBuilding(buildingType);
     if (success) {
       setSelectedBuilding(null);
+    }
+  };
+
+  const handleUpgrade = async (buildingId: string) => {
+    if (upgrading) return;
+    
+    setUpgrading(buildingId);
+    try {
+      const result = await apiService.upgradeBuilding(buildingId);
+      if (result.success) {
+        await refreshPlotData();
+      }
+    } catch (error) {
+      console.error('Upgrade failed:', error);
+    } finally {
+      setUpgrading(null);
     }
   };
 
@@ -317,16 +335,21 @@ export function BuildMenu() {
                     
                     {canUpgrade(existingBuilding) && (
                       <button
-                        onClick={() => upgradeBuilding(existingBuilding.id)}
-                        disabled={(plot.resources?.materials || 0) < getUpgradeCost(existingBuilding)}
+                        onClick={() => handleUpgrade(existingBuilding.id)}
+                        disabled={upgrading === existingBuilding.id || (plot.resources?.materials || 0) < getUpgradeCost(existingBuilding)}
                         className={`w-full mt-2 px-3 py-2 rounded border text-sm transition-colors ${
-                          (plot.resources?.materials || 0) >= getUpgradeCost(existingBuilding)
+                          upgrading === existingBuilding.id
+                            ? 'bg-gray-600 border-gray-500 text-gray-400 cursor-not-allowed'
+                            : (plot.resources?.materials || 0) >= getUpgradeCost(existingBuilding)
                             ? 'bg-green-600 border-green-500 text-white hover:bg-green-700'
                             : 'bg-gray-600 border-gray-500 text-gray-400 cursor-not-allowed'
                         }`}
                       >
                         <ArrowUp className="w-3 h-3 inline mr-1" />
-                        Upgrade to Level {existingBuilding.level + 1} ({getUpgradeCost(existingBuilding)} materials)
+                        {upgrading === existingBuilding.id 
+                          ? 'Upgrading...' 
+                          : `Upgrade to Level ${existingBuilding.level + 1} (${getUpgradeCost(existingBuilding)} materials)`
+                        }
                       </button>
                     )}
                     

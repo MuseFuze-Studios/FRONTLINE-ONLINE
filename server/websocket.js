@@ -43,7 +43,7 @@ export function setupWebSocket(server, JWT_SECRET) {
   // Broadcast updates to connected clients
   function broadcastUpdate(userId, data) {
     for (const [ws, user] of clients.entries()) {
-      if (user.id === userId && ws.readyState === WebSocket.OPEN) {
+      if (user.id === userId && ws.readyState === 1) { // Use numeric constant instead of WebSocket.OPEN
         try {
           ws.send(JSON.stringify(data));
         } catch (error) {
@@ -57,7 +57,7 @@ export function setupWebSocket(server, JWT_SECRET) {
   // Broadcast to all clients
   function broadcastToAll(data) {
     for (const [ws, user] of clients.entries()) {
-      if (ws.readyState === WebSocket.OPEN) {
+      if (ws.readyState === 1) { // Use numeric constant instead of WebSocket.OPEN
         try {
           ws.send(JSON.stringify(data));
         } catch (error) {
