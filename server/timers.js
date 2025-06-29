@@ -219,7 +219,7 @@ export function setupTimers(pool, gameSettings, broadcastToAll) {
         broadcastToAll({ type: 'map_update' }); // Update map for territory changes
       }
       
-      // Update resource generation every 2 minutes (IMPROVED FOOD GENERATION)
+      // Update resource generation every 10 minutes
       const [plots] = await pool.execute(`
         SELECT p.*, 
           (SELECT COUNT(*) FROM buildings WHERE plot_id = p.id AND type = 'industry' AND is_under_construction = FALSE) as industry_count,
@@ -227,8 +227,9 @@ export function setupTimers(pool, gameSettings, broadcastToAll) {
           (SELECT COUNT(*) FROM buildings WHERE plot_id = p.id AND type = 'storage' AND is_under_construction = FALSE) as storage_count,
           (SELECT COUNT(*) FROM buildings WHERE plot_id = p.id AND type = 'housing' AND is_under_construction = FALSE) as housing_count
         FROM plots p
-        WHERE TIMESTAMPDIFF(MINUTE, last_resource_update, NOW()) >= 2
+        WHERE TIMESTAMPDIFF(MINUTE, last_resource_update, NOW()) >= 10
       `);
+
       
       for (const plot of plots) {
         const timeDiff = Math.floor((now - new Date(plot.last_resource_update)) / 120000); // 2-minute intervals

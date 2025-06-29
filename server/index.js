@@ -735,47 +735,61 @@ app.get('/api/game/battle-stats', async (req, res) => {
 app.post('/api/player/collect-resources', authenticateToken, async (req, res) => {
   try {
     const playerId = req.user.id;
-    
+
     // Get player plot
     const [plotRows] = await pool.execute(
       'SELECT * FROM plots WHERE player_id = ?',
       [playerId]
     );
-    
+
     if (plotRows.length === 0) {
       return res.status(404).json({ error: 'Plot not found' });
     }
-    
+
     const plot = plotRows[0];
-    
-    // Calculate bonus resources (10% of current resources)
+
+    // --- Cooldown Logic ---
+    const now = Date.now();
+    const lastCollect = plot.last_collect_time ? new Date(plot.last_collect_time).getTime() : 0;
+    const cooldown = 10 * 60 * 1000; // 10 minutes
+    const timeSinceLast = now - lastCollect;
+
+    if (timeSinceLast < cooldown) {
+      const waitMs = cooldown - timeSinceLast;
+      return res.status(429).json({
+        error: 'Cooldown active. Please wait before collecting again.',
+        cooldown_remaining_ms: waitMs
+      });
+    }
+
+    // --- Calculate bonus (10%) ---
     const bonusManpower = Math.floor(plot.manpower * 0.1);
     const bonusMaterials = Math.floor(plot.materials * 0.1);
     const bonusFuel = Math.floor(plot.fuel * 0.1);
     const bonusFood = Math.floor(plot.food * 0.1);
-    
-    // Get storage capacity
+
+    // --- Storage cap ---
     const [storageRows] = await pool.execute(
       'SELECT COUNT(*) as storage_count FROM buildings WHERE plot_id = ? AND type = "storage" AND is_under_construction = FALSE',
       [plot.id]
     );
-    
     const storageCap = 1000 + (storageRows[0].storage_count * 500);
-    
-    // Apply bonus resources with storage cap
+
+    // --- Apply bonuses (respecting cap) ---
     const newManpower = Math.min(storageCap, plot.manpower + bonusManpower);
     const newMaterials = Math.min(storageCap, plot.materials + bonusMaterials);
     const newFuel = Math.min(storageCap, plot.fuel + bonusFuel);
     const newFood = Math.min(storageCap, plot.food + bonusFood);
-    
+
+    // ✅ FIXED: Proper SQL syntax
     await pool.execute(`
       UPDATE plots SET 
-        manpower = ?, materials = ?, fuel = ?, food = ?
+        manpower = ?, materials = ?, fuel = ?, food = ?, last_collect_time = NOW()
       WHERE id = ?
     `, [newManpower, newMaterials, newFuel, newFood, plot.id]);
-    
-    res.json({ 
-      success: true, 
+
+    res.json({
+      success: true,
       collected: {
         manpower: bonusManpower,
         materials: bonusMaterials,
